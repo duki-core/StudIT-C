@@ -1,0 +1,497 @@
+rules:
+  - id: bank-header-trusted-identity
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Идентификатор пользователя берётся из заголовка запроса (X-User-Id), который
+      полностью контролирует клиент. Любой может выдать себя за другого пользователя
+      и получить доступ к его счетам (Broken Authentication -> IDOR).
+    metadata:
+      cwe: ["CWE-287: Improper Authentication", "CWE-639: Authorization Bypass Through User-Controlled Key"]
+      owasp: ["A01:2021 - Broken Access Control", "A07:2021 - Identification and Authentication Failures"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern-inside: |
+          async def $F(..., $H: $T = Header(...), ...):
+            ...
+      - pattern: return int($H)
+
+  - id: bank-balance-check-without-row-lock
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Баланс читается обычным SELECT без блокировки строки (FOR UPDATE), а списание
+      выполняется отдельным UPDATE. Параллельные переводы проходят проверку
+      "bal < amount" одновременно и уводят счёт в минус (race condition / double spending).
+    metadata:
+      cwe: ["CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization", "CWE-367: TOCTOU"]
+      owasp: ["A04:2021 - Insecure Design"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: $BAL = await $CONN.fetchval("$SQL", ...)
+      - metavariable-regex:
+          metavariable: $SQL
+          regex: (?i)^\s*SELECT\s+balance(?![\s\S]*FOR\s+UPDATE)
+
+  - id: bank-like-wildcard-injection
+    languages: [python]
+    severity: INFO
+    message: >-
+      Пользовательский ввод подставляется в шаблон ILIKE без экранирования символов % и _.
+      Это не SQL-инъекция, но позволяет управлять шаблоном поиска и нагружать БД
+      тяжёлыми запросами.
+    metadata:
+      cwe: ["CWE-155: Improper Neutralization of Wildcards or Matching Symbols"]
+      category: security
+      confidence: MEDIUM
+    pattern: $PARAMS.append(f"%{$X}%")
+
+  - id: bank-amount-without-upper-bound
+    languages: [python]
+    severity: INFO
+    message: >-
+      Сумма перевода ограничена только снизу (gt=0). Нет верхнего (бизнес-) лимита на
+      сумму одной операции: весь баланс можно вывести одним запросом, антифрод-контроль
+      на уровне API отсутствует.
+    metadata:
+      cwe: ["CWE-20: Improper Input Validation", "CWE-840: Business Logic Errors"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: "$NAME: int = Field(gt=$N)"
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*amount.*
+
+  - id: bank-cache-invalidation-key-mismatch
+    languages: [python]
+    severity: INFO
+    message: >-
+      После перевода удаляется ключ "tx:<user_id>", но кеш истории хранится под ключами
+      "tx:<user_id>:<limit>:<search>". Инвалидация не срабатывает; кроме того, при
+      попадании в кеш функция возвращает пустой список, а сам кеш нигде не заполняется.
+      Логика кеширования некорректна: при её "починке" клиенты увидят устаревшую историю.
+    metadata:
+      cwe: ["CWE-524: Use of Cache Containing Sensitive Information", "CWE-670: Always-Incorrect Control Flow Implementation"]
+      category: correctness
+      confidence: HIGH
+    pattern: await $R.delete(f"tx:{$U}")
+
+  - id: bank-fastapi-docs-exposed
+    languages: [python]
+    severity: INFO
+    message: >-
+      FastAPI создаётся с включёнными /docs, /redoc и /openapi.json. В продуктиве
+      это раскрывает полную карту API атакующему.
+    metadata:
+      cwe: ["CWE-200: Exposure of Sensitive Information"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: FastAPI(...)
+      - pattern-not: FastAPI(..., docs_url=None, ...)
+
+  - id: compose-hardcoded-db-password
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      Пароль БД задан открытым текстом в docker-compose (и это пароль по умолчанию
+      "postgres"). Секреты должны храниться в менеджере секретов / Docker secrets.
+    metadata:
+      cwe: ["CWE-798: Use of Hard-coded Credentials", "CWE-1393: Use of Default Password"]
+      owasp: ["A07:2021 - Identification and Authentication Failures"]
+      category: security
+      confidence: HIGH
+    pattern-either:
+      - pattern: "POSTGRES_PASSWORD: $P"
+      - pattern-regex: postgres(ql)?://[^:\s]+:[^@\s]+@
+
+  - id: compose-datastore-port-exposed
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Порт PostgreSQL/Redis опубликован на хосте (на всех интерфейсах). База и кеш
+      должны быть доступны только API во внутренней сети Docker.
+    metadata:
+      cwe: ["CWE-668: Exposure of Resource to Wrong Sphere"]
+      category: security
+      confidence: HIGH
+    pattern-regex: \"(5432|6379):(5432|6379)\"
+
+  - id: redis-without-auth-tls
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      Подключение к Redis без пароля и без TLS (redis://host вместо rediss://user:pass@host).
+      Вместе с опубликованным портом 6379 любой в сети может читать/менять кеш.
+    metadata:
+      cwe: ["CWE-306: Missing Authentication for Critical Function", "CWE-319: Cleartext Transmission"]
+      category: security
+      confidence: HIGH
+    pattern-regex: redis://(?![^/\s]*@)[^\s]+
+
+  - id: postgres-dsn-without-tls
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      DSN PostgreSQL без sslmode=require/verify-full: финансовые данные передаются
+      между API и БД открытым текстом.
+    metadata:
+      cwe: ["CWE-319: Cleartext Transmission of Sensitive Information"]
+      category: security
+      confidence: MEDIUM
+    pattern-regex: postgres(ql)?://(?![^\s]*sslmode=)[^\s]+
+
+  - id: compose-image-not-pinned
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      Образ указан по плавающему тегу без digest (sha256). Сборка не воспроизводима,
+      возможна подмена образа (supply chain).
+    metadata:
+      cwe: ["CWE-1357: Reliance on Insufficiently Trustworthy Component"]
+      category: security
+      confidence: LOW
+    pattern-regex: 'image:\s*[a-z0-9./-]+:[0-9a-z.]+\s*$'
+
+  - id: bank-unordered-row-updates-deadlock
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Две строки accounts обновляются в порядке "сначала отправитель, потом получатель".
+      Встречные переводы A->B и B->A блокируют строки в противоположном порядке, и PostgreSQL
+      прерывает одну из транзакций с "deadlock detected" -> клиент получает 500
+      (подтверждено: 24 из 40 встречных запросов). Блокировать строки нужно в фиксированном
+      порядке (по id) одним SELECT ... ORDER BY id FOR UPDATE.
+    metadata:
+      cwe: ["CWE-833: Deadlock"]
+      owasp: ["A04:2021 - Insecure Design"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: |
+          await $C.execute("$Q1", $X, $A)
+          await $C.execute("$Q2", $Y, $B)
+      - metavariable-regex:
+          metavariable: $Q1
+          regex: (?i)^\s*UPDATE\s+accounts
+      - metavariable-regex:
+          metavariable: $Q2
+          regex: (?i)^\s*UPDATE\s+accounts
+
+  - id: bank-self-transfer-not-rejected
+    languages: [python]
+    severity: INFO
+    message: >-
+      Функция перевода не запрещает from_account_id == to_account_id. Перевод самому себе
+      возвращает 200 и создаёт фиктивную транзакцию: накрутка оборота, засорение истории,
+      помехи антифроду и лимитам по числу операций.
+    metadata:
+      cwe: ["CWE-840: Business Logic Errors", "CWE-20: Improper Input Validation"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: |
+          async def $FN(..., $FROM: int, $TO: int, ...):
+            ...
+      - metavariable-regex:
+          metavariable: $FROM
+          regex: ^from
+      - metavariable-regex:
+          metavariable: $TO
+          regex: ^to
+      - pattern-not: |
+          async def $FN(..., $FROM: int, $TO: int, ...):
+            ...
+            if <... $FROM == $TO ...>:
+              ...
+            ...
+      - focus-metavariable: $FN
+
+  - id: bank-cache-hit-returns-empty
+    languages: [python]
+    severity: WARNING
+    message: >-
+      При попадании в кеш функция возвращает пустой список вместо закешированных данных.
+      Любое значение, записанное в Redis под ключом tx:<user_id>:<limit>:<search>
+      (Redis открыт без пароля), скрывает от клиента всю историю операций
+      (подтверждено: 20 записей -> []).
+    metadata:
+      cwe: ["CWE-670: Always-Incorrect Control Flow Implementation", "CWE-345: Insufficient Verification of Data Authenticity"]
+      category: security
+      confidence: HIGH
+    pattern: |
+      $V = await $R.get(...)
+      if $V:
+        return []
+
+  - id: bank-account-existence-oracle
+    languages: [python]
+    severity: INFO
+    message: >-
+      Для несуществующего счёта получателя возвращается отдельный ответ 404 "To account not found".
+      Перебором to_account_id (переводы по 1 коп.) можно составить список всех счетов банка.
+    metadata:
+      cwe: ["CWE-204: Observable Response Discrepancy"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      category: security
+      confidence: MEDIUM
+    pattern-regex: HTTPException\(status_code=404, detail="To account not found"\)
+
+  - id: bank-id-field-without-range
+    languages: [python]
+    severity: INFO
+    message: >-
+      Поле-идентификатор объявлено как int без границ. Значения >= 2^63 переполняют BIGINT
+      при передаче в asyncpg -> необработанное исключение и 500 Internal Server Error
+      (подтверждено: from_account_id = 2^63 -> 500). Нужны Field(gt=0, lt=2**63).
+    metadata:
+      cwe: ["CWE-1284: Improper Validation of Specified Quantity in Input", "CWE-190: Integer Overflow or Wraparound"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern-inside: |
+          class $M(BaseModel):
+            ...
+      - pattern: "$NAME: int"
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: .*account_id$
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(?!.*Out$).*
+
+  - id: bank-header-int-without-range
+    languages: [python]
+    severity: INFO
+    message: >-
+      Значение заголовка приводится через int() без проверки диапазона и формата: принимаются
+      отрицательные значения (-5), пробелы и подчёркивания (" 1_0 " -> 10), а 2^63 вызывает
+      500 Internal Server Error из-за переполнения BIGINT.
+    metadata:
+      cwe: ["CWE-1284: Improper Validation of Specified Quantity in Input", "CWE-20: Improper Input Validation"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern-inside: |
+          async def $F(..., $H: $T = Header(...), ...):
+            ...
+      - pattern: int($H)
+
+  - id: bank-ownership-check-outside-transaction
+    languages: [python]
+    severity: INFO
+    message: >-
+      Проверка владельца счёта выполняется в отдельном соединении до транзакции перевода
+      (check-then-act). Сейчас не эксплуатируется: в сервисе нет операции смены владельца.
+      Проверку нужно выполнять в той же транзакции, что и списание.
+    metadata:
+      cwe: ["CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition"]
+      category: security
+      confidence: LOW
+    patterns:
+      - pattern: |
+          await $CHECK(...)
+          ...
+          async with $P.acquire() as $C:
+            ...
+      - metavariable-regex:
+          metavariable: $CHECK
+          regex: .*own.*
+
+  - id: bank-schema-without-foreign-keys
+    languages: [python]
+    severity: INFO
+    message: >-
+      Таблица transactions создаётся без FOREIGN KEY на accounts, индекса по
+      accounts.owner_user_id нет. Целостность ссылок не гарантируется БД, JOIN по владельцу
+      при росте данных выполняется полным перебором.
+    metadata:
+      cwe: ["CWE-1188: Initialization of a Resource with an Insecure Default"]
+      category: correctness
+      confidence: MEDIUM
+    pattern-regex: CREATE TABLE IF NOT EXISTS transactions\((?:(?!REFERENCES)[^;])*\);
+
+  - id: bank-seed-data-in-production-code
+    languages: [python]
+    severity: INFO
+    message: >-
+      init_db при пустой БД автоматически создаёт счета с балансом (500000 и 250000)
+      для пользователей 1 и 2. Тестовые данные в продовом коде: при первом развёртывании
+      появляются счета с деньгами, не связанные с реальными клиентами.
+    metadata:
+      cwe: ["CWE-1188: Initialization of a Resource with an Insecure Default", "CWE-489: Active Debug Code"]
+      category: security
+      confidence: HIGH
+    pattern-regex: INSERT INTO accounts\(owner_user_id, balance_cents\)\s*VALUES
+
+  - id: bank-cache-call-after-commit-unhandled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Обращение к Redis выполняется после коммита транзакции перевода и без обработки ошибок.
+      Если Redis недоступен, деньги уже списаны, а клиент получает 500; повтор запроса
+      списывает деньги ещё раз (ключа идемпотентности нет). Подтверждено: 2 запроса при
+      недоступном Redis -> оба 500, списано дважды.
+    metadata:
+      cwe: ["CWE-703: Improper Check or Handling of Exceptional Conditions", "CWE-841: Improper Enforcement of Behavioral Workflow"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern-inside: |
+          async with $P.acquire() as $C:
+            ...
+          ...
+      - pattern: await $R.delete(...)
+      - pattern-not-inside: |
+          try:
+            ...
+          except ...:
+            ...
+
+  - id: bank-cache-read-single-point-of-failure
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Чтение кеша Redis выполняется до запроса в БД без обработки ошибок и без запасного пути.
+      При недоступности Redis эндпоинт истории отдаёт 500 (подтверждено): кеш стал единой
+      точкой отказа.
+    metadata:
+      cwe: ["CWE-754: Improper Check for Unusual or Exceptional Conditions"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern: $V = await $R.get(...)
+      - pattern-not-inside: |
+          try:
+            ...
+          except ...:
+            ...
+
+  - id: bank-db-pool-without-timeouts
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Пул asyncpg создаётся с max_size=5 и без command_timeout / statement_timeout. Пять
+      медленных запросов (ILIKE по CAST(t.id AS TEXT) без индекса) занимают весь пул, и
+      переводы ждут без ограничения. Подтверждено на 3 млн транзакций: перевод 4 мс ->
+      4,3 с при 10 параллельных поисках.
+    metadata:
+      cwe: ["CWE-400: Uncontrolled Resource Consumption", "CWE-770: Allocation of Resources Without Limits or Throttling"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern: asyncpg.create_pool(...)
+      - pattern-not: asyncpg.create_pool(..., command_timeout=$T, ...)
+
+  - id: bank-config-bypass-env-access
+    languages: [python]
+    severity: INFO
+    message: >-
+      DSN БД читается напрямую из os.environ в обход класса Settings (где поле postgres_dsn
+      уже объявлено). Конфигурация разнесена по двум местам, валидация Settings не применяется.
+    metadata:
+      cwe: ["CWE-1188: Initialization of a Resource with an Insecure Default"]
+      category: correctness
+      confidence: HIGH
+    pattern: os.environ["POSTGRES_DSN"]
+
+  - id: bank-insecure-default-app-env
+    languages: [python]
+    severity: INFO
+    message: >-
+      Окружение по умолчанию "dev". Если в продуктиве переменная APP_ENV не задана, любые
+      защитные настройки, завязанные на app_env (например отключение /docs), не включатся.
+      Сейчас app_env в коде нигде не используется - это заложенный небезопасный дефолт.
+    metadata:
+      cwe: ["CWE-1188: Initialization of a Resource with an Insecure Default"]
+      category: security
+      confidence: MEDIUM
+    pattern: 'app_env: str = "dev"'
+
+  - id: bank-ddl-at-startup
+    languages: [python]
+    severity: INFO
+    message: >-
+      Приложение выполняет CREATE TABLE при старте, значит его учётной записи нужны права на
+      изменение схемы (противоречит принципу минимальных привилегий). При одновременном
+      старте нескольких реплик CREATE TABLE IF NOT EXISTS падает (UniqueViolation /
+      DuplicateTable), а проверка COUNT(*) -> INSERT задваивает тестовые счета
+      (подтверждено: 4 реплики, 10 запусков -> в одном 4 счёта вместо 2, 28 исключений).
+    metadata:
+      cwe: ["CWE-250: Execution with Unnecessary Privileges", "CWE-362: Race Condition"]
+      category: security
+      confidence: HIGH
+    patterns:
+      - pattern: await $C.execute("$Q")
+      - metavariable-regex:
+          metavariable: $Q
+          regex: (?i)\s*CREATE\s+TABLE
+
+  - id: bank-global-sequential-tx-id-exposed
+    languages: [python]
+    severity: INFO
+    message: >-
+      Клиенту возвращается глобальный последовательный transaction_id (BIGSERIAL). По разнице
+      между двумя своими переводами клиент узнаёт, сколько операций провёл банк за это время
+      (подтверждено: id 3 -> 11 = 7 чужих операций, совпадает с фактом). Утечка бизнес-метрик.
+    metadata:
+      cwe: ["CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"]
+      category: security
+      confidence: HIGH
+    pattern: 'return {..., "transaction_id": $X, ...}'
+
+  - id: compose-depends-on-without-healthcheck
+    languages: [yaml]
+    severity: INFO
+    message: >-
+      depends_on без condition: service_healthy и без healthcheck у БД/Redis. API может
+      стартовать раньше готовности PostgreSQL и упасть в init_db; политики restart нет.
+    metadata:
+      cwe: ["CWE-754: Improper Check for Unusual or Exceptional Conditions"]
+      category: correctness
+      confidence: HIGH
+    pattern-regex: 'depends_on:\s*\n(?:\s*-\s*[\w-]+\s*\n?)+'
+
+  - id: requirements-without-hashes
+    languages: [generic]
+    severity: INFO
+    message: >-
+      Зависимости зафиксированы только версией, без хешей (--require-hashes) и без lock-файла
+      для транзитивных пакетов. Подмена пакета в индексе или зеркале не будет обнаружена
+      (supply chain).
+    metadata:
+      cwe: ["CWE-494: Download of Code Without Integrity Check", "CWE-1357: Reliance on Insufficiently Trustworthy Component"]
+      category: security
+      confidence: HIGH
+    paths:
+      include: ["requirements*.txt"]
+    pattern-regex: '(?m)^fastapi==[^\s]+$'
+
+  - id: bank-missing-security-headers
+    languages: [python]
+    severity: INFO
+    message: >-
+      Приложение FastAPI создаётся без middleware, добавляющего заголовки безопасности.
+      Ответы с историей транзакций уходят без Cache-Control: no-store, HSTS,
+      X-Content-Type-Options (подтверждено: в ответе /transactions только content-type и
+      content-length). Банковские данные могут сохраниться в кеше браузера или прокси.
+    metadata:
+      cwe: ["CWE-525: Use of Web Browser Cache Containing Sensitive Information", "CWE-693: Protection Mechanism Failure"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern: $APP = FastAPI(...)
+      - pattern-not-inside: |
+          $APP = FastAPI(...)
+          ...
+          $APP.add_middleware(...)
+      - pattern-not-inside: |
+          $APP = FastAPI(...)
+          ...
+          @$APP.middleware("http")
+          async def $MW(...):
+            ...
